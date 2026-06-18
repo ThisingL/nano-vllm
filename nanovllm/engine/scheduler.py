@@ -22,10 +22,10 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
+        # prefill
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
@@ -38,12 +38,14 @@ class Scheduler:
             self.running.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:
+            # prefill 优先，如果有需要 prefill 的，就不进行后面的 decode
             return scheduled_seqs, True
 
         # decode
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
+                # 如果显存不够了，就尝试把 running 中的其他 sequence 资源释放掉
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -58,6 +60,7 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        """将 sequence 从 Running -> Waiting，并且释放掉 block 资源"""
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)

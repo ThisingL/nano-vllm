@@ -18,20 +18,22 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        self.ps = []
-        self.events = []
-        ctx = mp.get_context("spawn")
+        self.ps = [] # 为了支持多卡
+        self.events = [] # 为了支持多卡
+        ctx = mp.get_context("spawn") # spawn 可以启动一个干净上下文的子进程，而非 fork
         for i in range(1, config.tensor_parallel_size):
+            # 这里是子节点 tp 并行的多进程逻辑
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
+        # 主进程逻辑
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        atexit.register(self.exit) # 钩子函数，在进程结束时调用 exit() 方法，自然的触发多进程的清理
 
     def exit(self):
         self.model_runner.call("exit")
@@ -46,6 +48,9 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        """
+        真正执行任务
+        """
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
@@ -74,6 +79,7 @@ class LLMEngine:
             t = perf_counter()
             output, num_tokens = self.step()
             if use_tqdm:
+                # 通过 step() 返回值正or负来区分是 prefill 还是 decode
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
                 else:

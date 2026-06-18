@@ -48,6 +48,7 @@ class Sequence:
 
     @property
     def completion_token_ids(self):
+        """返回 decode 生成的所有 tokens(不包括 prompt tokens)"""
         return self.token_ids[self.num_prompt_tokens:]
 
     @property
@@ -67,6 +68,7 @@ class Sequence:
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        """Sequence 里的 token_ids 加上传入的 token_id"""
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
