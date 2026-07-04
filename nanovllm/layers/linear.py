@@ -19,7 +19,7 @@ class LinearBase(nn.Module):
         tp_dim: int | None = None,
     ):
         super().__init__()
-        self.tp_dim = tp_dim
+        self.tp_dim = tp_dim # 沿哪个维度切分
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -60,7 +60,7 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
     ):
         tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        super().__init__(input_size, divide(output_size, tp_size), bias, 0) # 0 表示按 output 维度切
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -89,7 +89,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank] # 把权重文件按照 output 维度切成 tp_size 块，取出第 tp_rank 块
         param_data.copy_(loaded_weight)
 
 
@@ -106,7 +106,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
-        self.num_heads = divide(total_num_heads, tp_size)
+        self.num_heads = divide(total_num_heads, tp_size) # 只要处理自己 tp 分到的 head
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
@@ -137,13 +137,13 @@ class RowParallelLinear(LinearBase):
         bias: bool = False,
     ):
         tp_size = dist.get_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        super().__init__(divide(input_size, tp_size), output_size, bias, 1) # 1 表示按 input 维度切
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        shard_size = param_data.size(self.tp_dim)
+        shard_size = param_data.size(self.tp_dim) # 获取 input 维度的 size，以及是切分后的大小
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size) # 对权重文件在 input 维度上从 start_idx 开始切出 shard_size 大小的块
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

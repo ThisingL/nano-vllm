@@ -73,14 +73,14 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
+        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)) # 对 q 每一个子 head 单独做一个 RMSNorm
+        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)) # 对 k 每一个子 head 单独做一个 RMSNorm
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
+        # q、k、v shape = [N, num_heads, head_dim]
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
-
 
 class Qwen3MLP(nn.Module):
 
@@ -91,11 +91,13 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
+        # Merged 是因为我们将 gate 和 up 矩阵合并计算，column 是因为列切分
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
+        # row 是因为这里的 down 矩阵我们进行行切分
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -178,6 +180,11 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+
+    # 这里的 packed_modules_mapping 是为了方便做算子融合
+    # 比如 q、k、v 矩阵可以并行计算
+    # 因此就可以按照列合并成一个大矩阵 qkv，然后做一次乘法就可以同时计算出 W_q、W_k、W_v
+    # gate、up 矩阵同理
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -193,6 +200,7 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        # 强制让 lm_head 和 embed_tokens 指向同一块内存，省一块显存空间
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 

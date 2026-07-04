@@ -19,7 +19,7 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         self.ps = [] # 为了支持多卡
-        self.events = [] # 为了支持多卡
+        self.events = [] # 为了支持多卡，信号量机制
         ctx = mp.get_context("spawn") # spawn 可以启动一个干净上下文的子进程，而非 fork
         for i in range(1, config.tensor_parallel_size):
             # 这里是子节点 tp 并行的多进程逻辑
