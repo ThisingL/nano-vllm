@@ -1,7 +1,8 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.distributed as dist
-from transformers import Qwen2Config
+from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -11,7 +12,7 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
-class Qwen2Attention(nn.Module):
+class Qwen3MoeAttention(nn.Module):
 
     def __init__(
         self,
@@ -19,6 +20,9 @@ class Qwen2Attention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         max_position: int = 4096 * 32,
+        head_dim: int | None = None,
+        rms_norm_eps: float = 1e-06,
+        qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
     ) -> None:
@@ -30,17 +34,17 @@ class Qwen2Attention(nn.Module):
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
         self.num_kv_heads = self.total_num_kv_heads // tp_size
-        self.head_dim = hidden_size // self.total_num_heads
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=qkv_bias,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -60,6 +64,8 @@ class Qwen2Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -68,16 +74,15 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
+        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
-
-class Qwen2MLP(nn.Module):
+class Qwen3MoeMLP(nn.Module):
 
     def __init__(
         self,
@@ -106,28 +111,115 @@ class Qwen2MLP(nn.Module):
         return x
 
 
-class Qwen2DecoderLayer(nn.Module):
+class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Qwen3MoeConfig,
     ) -> None:
         super().__init__()
-        self.self_attn = Qwen2Attention(
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.hidden_act = config.hidden_act
+
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+
+        # gating
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [
+                Qwen3MoeMLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                    hidden_act=config.hidden_act,
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor):
+        sequence_length, hidden_dim = hidden_states.shape
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        # routing_weights: [token, top_k]
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        # 准备输出结果
+        final_hidden_states = torch.zeros(
+            hidden_states.shape,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        # One hot 可以创建一个掩码，除了选中的 One 专家外，其他专家都是
+        # selected_experts：[token, top_k]
+        # expert_mask: [expert, top_k, token]
+        expert_mask = torch.nn.functional.one_hot(
+            selected_experts, num_classes=self.num_experts
+        ).permute(2, 1, 0)
+
+        # 算出每个 expert 被选中的次数，然后把 > 0 的设置为 true，否则 false
+        # 最后把所有为 true 的 expert 都取出来
+        expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hitted:
+            expert_layer = self.experts[expert_idx]
+            top_x, token_idx = torch.where(expert_mask[expert_idx].squeeze(0))  # 返回第 expert_idx 位 expert 中非零的 top_x 和 token_idx
+
+            current_state = hidden_dim[top_x]
+            # 将各专家结果乘上它们的路由概率
+            current_hidden_states = (
+                expert_layer(current_state) * routing_weights[token_idx, top_x, None]
+            )
+
+            # 将各专家输出累加
+            final_hidden_states.index_add_(
+                0, token_idx, current_hidden_states.to(hidden_states.dtype)
+            )
+        return final_hidden_states
+
+
+class Qwen3MoeDecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: Qwen3MoeConfig,
+        layer_idx: int = -1,
+    ) -> None:
+        super().__init__()
+        self.self_attn = Qwen3MoeAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
+            rms_norm_eps=config.rms_norm_eps,
+            qkv_bias=getattr(config, "attention_bias", False),
+            head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen2MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        if (layer_idx not in mlp_only_layers) and (
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(config=config)
+        else:
+            self.mlp = Qwen3MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+            )
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -146,15 +238,22 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen2Model(nn.Module):
+class Qwen3MoeModel(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Qwen3MoeConfig,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size
+        )
+        self.layers = nn.ModuleList(
+            [
+                Qwen3MoeDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -170,7 +269,7 @@ class Qwen2Model(nn.Module):
         return hidden_states
 
 
-class Qwen2ForCausalLM(nn.Module):
+class Qwen3MoeForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -181,10 +280,10 @@ class Qwen2ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2Config
+        config: Qwen3MoeConfig
     ) -> None:
         super().__init__()
-        self.model = Qwen2Model(config)
+        self.model = Qwen3MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

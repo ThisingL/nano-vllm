@@ -3,12 +3,16 @@ from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 import argparse
 
-def main(model_path: str):
-    path = os.path.expanduser(model_path)
+def main(args: str):
+    path = os.path.expanduser(args.model_path)
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(
+        path, enforce_eager=args.enforce_eager, tensor_parallel_size=args.tensor_parallel_size
+    )
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=512)
+    sampling_params = SamplingParams(
+        temperature=args.temperature, max_tokens=args.max_tokens
+    )
     history = []  # 多轮对话历史
 
     print("已加载模型，开始对话（输入 'quit' 或 'exit' 退出，输入 'clear' 清空历史）")
@@ -51,6 +55,11 @@ if __name__ == "__main__":
     argparse.add_argument(
         "--model-path", type=str, default="/home/lixin370/nano-vllm/models/Qwen3-0.6B/",
     )
+    argparse.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
+    argparse.add_argument(
+        "--enforce-eager", type = bool, default=True, help="禁用 CUDA Graph 优化"
+    )
+    argparse.add_argument("--temperature", type=float, default=0.6)
+    argparse.add_argument("--max-tokens", type=int, default=512)
     args = argparse.parse_args()
-    main(args.model_path)
-    
+    main(args)
