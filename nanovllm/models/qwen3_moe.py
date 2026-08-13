@@ -121,7 +121,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.hidden_act = config.hidden_act
-
+        self.norm_topk_prob = config.norm_topk_prob
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
 
@@ -172,7 +172,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             expert_layer = self.experts[expert_idx]
             top_x, token_idx = torch.where(expert_mask[expert_idx].squeeze(0))  # 返回第 expert_idx 位 expert 中非零的 top_x 和 token_idx
 
-            current_state = hidden_dim[top_x]
+            current_state = hidden_states[top_x]
             # 将各专家结果乘上它们的路由概率
             current_hidden_states = (
                 expert_layer(current_state) * routing_weights[token_idx, top_x, None]
@@ -205,6 +205,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
         )
         mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        # 判断是 expert 层还是 MLP 层
         if (layer_idx not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
