@@ -6,7 +6,9 @@ from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
-
+    """
+    决定将哪些 Sequence 调度进入 ModelRunner
+    """
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens

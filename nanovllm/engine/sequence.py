@@ -12,13 +12,13 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size = 256
+    block_size = 256  # 每个 block 有多少 token
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
-        self.token_ids = copy(token_ids)
+        self.token_ids = copy(token_ids) # 由多个 token_id 组成一个 sequence
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)

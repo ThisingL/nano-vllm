@@ -12,9 +12,9 @@ class Context:
     - cu_seqlens_k:  K 的累积长度，有 Prefix Cache 时比 Q 长                       None
     - max_seqlen_q:  这批 seq 中最长的 Q 长度                                     None
     - max_seqlen_k:  这批 seq 中最长的 K 长度                                     None
-    - slot_mapping:  每个新 token 的 K/V 要写到 cache 的哪个 block 中              每个新 token 的 K/V 要写到 cache 的哪个 block 中
+    - slot_mapping:  （写侧地址）每个新 token 的 K/V 要写到 cache 的哪个 block 中              同 prefill
     - context_lens:  None                                                      每条 seq 当前的总长度，FlashAttention 据此决定回看多远
-    - block_tables:  只有命中 Prefix Cache 时才需要，用于 FlashAttention 查历史 KV  每条 seq 的"页表"，FlashAttention 用它找到所有历史 KV
+    - block_tables:  （读侧地址）只有命中 Prefix Cache 时才需要，用于 FlashAttention 查历史 KV  每条 seq 的"页表"，FlashAttention 用它找到所有历史 KV
     """
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None

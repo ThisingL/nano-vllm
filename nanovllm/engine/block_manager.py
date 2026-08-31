@@ -27,9 +27,10 @@ class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
+        # num_blocks 的值在 model_runner 中被 allocate_kv_cache 分配，由当前的剩余显存决定
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.free_block_ids: deque[int] = deque(range(num_blocks)) # 用堆是为了 LRU
         self.used_block_ids: set[int] = set()
 
     @classmethod
@@ -72,12 +73,13 @@ class BlockManager:
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids: # 比较 token_ids 既可以防御 hash 碰撞，也可以防止 block 被 update 了
                 cache_miss = True
-            if cache_miss:
+            if cache_miss: # 这里非常妙，只要一个地方开始 miss，后续全都 miss了。也是为了简洁，主动放弃了一些收益
+                # 未命中 cache
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
                 # 命中 cache
-                seq.num_cached_tokens += self.block_size
+                seq.num_cached_tokens += self.block_size # 记录着多少个已经缓存了 k 和 v
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -85,13 +87,13 @@ class BlockManager:
                     # 这个分支有点 trick
                     block = self._allocate_block(block_id)
             if h != -1:
-                block.update(h, token_ids)
+                block.update(h, token_ids) # 因为 _allocate_block 中会清空这两个参数
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
         """反向释放掉 Sequence 中的所有的 block_table"""
-        # 反向释放我的理解是前缀更容易被复用，所以应该晚点 ref_count--
+        # 反向释放我的理解是前缀更容易被复用，所以应该晚点 ref_count --
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
@@ -107,7 +109,9 @@ class BlockManager:
         判断是否有足够的 free block
         """
         # 太 trick 了，但也真的优雅
-        # self.block_size == 1 代表刚开了一个新的 block
+        # len(seq) % self.block_size == 1 代表现在生成的一个 token，正好需要新开一个 block
+        # 这里可能有人感觉疑惑，似乎调用方还没有生成下一个 token
+        # 其实是因为 token_ids 有 n 个 token 时，其实 KV 只有前 n - 1 个 token 的
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):

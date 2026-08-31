@@ -69,7 +69,7 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping) # 把本次算出的 k，v 写入 cache
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache

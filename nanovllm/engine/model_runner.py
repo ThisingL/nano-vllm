@@ -129,7 +129,7 @@ class ModelRunner:
         # 2 代表 K 和 V 两个向量，block_size 是一个 block 里有多少个 token，num_kv_heads 是每个 token 有多少个 KV head
         # head_dim 是每个 head 的维度，torch_dtype.itemsize 是每个元素占多少字节
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes # 算出当前剩余显存能分配多少 block 给 kv cache
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes # 算出当前剩余显存能分配多少 block 给 kv cache，会修改 config 中的信息，决定 BlockManager 中的 Block 总数
         assert config.num_kvcache_blocks > 0
         # 6 维张量，一次性申请完所有的 KV  Cache 显存
         # dim 0: 2          → K 或 V
@@ -147,26 +147,29 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        """
+        给 FlashAttention 打包好需要的页表
+        """
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs] # tensor 需要是矩阵，所以做了对齐
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = [] # 只取未缓存的部分（需要实际跑 prefill 的 token）
         positions = [] # 也只从未缓存的位置开始（用于 RoPE 位置编码）
-        cu_seqlens_q = [0]
+        cu_seqlens_q = [0] # 每个 sequence 的 q 的偏移
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
-        block_tables = None
+        slot_mapping = [] # 写侧地址
+        block_tables = None # 读侧地址
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens # Q 矩阵只要包含没有计算过的(没有 kv cache)的
-            seqlen_k = seqlen # k,v 矩阵需要读取所有 token 的来用于和 Q 做运算(包含 kv cache 过的)，因为每次算 Q 都要和所有 token 的 k 和 v 做计算
+            seqlen_k = seqlen # 需要读取所有 token 的 k,v 矩阵来用于和 Q 做运算(包含 kv cache 过的)，因为每次算 Q 都要和所有 token 的 k 和 v 做计算
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -174,6 +177,7 @@ class ModelRunner:
             if not seq.block_table:    # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
+                # 把需要计算的 input_ids 翻译成全局的 kv 中的 token 位置，方便后续计算出来 k,v 直接写入就行
                 # slot = block_id * block_size + block 内的偏移
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
